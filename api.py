@@ -564,9 +564,11 @@ def _normalize_response(raw: Optional[str]) -> str:
 def _parse_gql_errors(errors: list) -> str:
     """
     Try to extract a meaningful response code from a GraphQL errors list.
-    Conservative: only returns a specific code for very clear matches.
-    Returns 'GRAPHQL_ERROR' for anything ambiguous so callers can retry.
+    Returns specific codes for clear matches, GRAPHQL_ERROR only for
+    unambiguous schema/API issues (unknown fields, syntax errors).
+    For anything that looks payment/checkout related, returns CARD_DECLINED.
     """
+    has_schema_error = False
     for err in errors:
         for field in ("code", "nonLocalizedMessage", "localizedMessage",
                       "message", "localizedMessageHtml", "messageUntranslated"):
@@ -577,15 +579,20 @@ def _parse_gql_errors(errors: list) -> str:
             if norm != "CARD_DECLINED":
                 return norm
             upper = raw.upper()
-            # Only match very specific card-decline phrases (not broad substrings)
+            # Specific card-decline phrases
             if any(k in upper for k in ("PAYMENT_DECLINED", "CARD_DECLINED",
                                          "CHARGE_DECLINED", "CARD_WAS_DECLINED",
-                                         "FRAUD")):
+                                         "FRAUD", "DECLINED", "REFUSED",
+                                         "DO_NOT_HONOR", "DO NOT HONOR",
+                                         "PAYMENT_FAILED", "PAYMENT FAILED",
+                                         "TRANSACTION_FAILED", "NOT_ACCEPTED")):
                 return "CARD_DECLINED"
             if any(k in upper for k in ("CHECKOUT_ALREADY_COMPLETED", "ALREADY_ACCEPTED")):
                 return "CARD_DECLINED"
             if any(k in upper for k in ("SESSION_EXPIRED", "SESSION_INVALID",
-                                         "TOKEN_EXPIRED", "INVALID_SESSION")):
+                                         "TOKEN_EXPIRED", "INVALID_SESSION",
+                                         "SESSION_NOT_FOUND", "INVALID_TOKEN",
+                                         "EXPIRED", "SESSION HAS EXPIRED")):
                 return "SESSION_EXPIRED"
             if any(k in upper for k in ("LOGIN_REQUIRED", "ACCOUNT_REQUIRED",
                                          "CUSTOMER_DISABLED")):
@@ -596,7 +603,15 @@ def _parse_gql_errors(errors: list) -> str:
             if any(k in upper for k in ("THROTTLED", "RATE_LIMIT", "TOO_MANY_REQUESTS",
                                          "RATE_LIMITED", "RETRY_LATER")):
                 return "THROTTLED"
-    return "GRAPHQL_ERROR"
+            # Detect genuine schema/API errors (only these should be GRAPHQL_ERROR)
+            if any(k in upper for k in ("UNKNOWN_FIELD", "SYNTAX_ERROR",
+                                         "VARIABLE_NOT_PROVIDED", "PARSE_ERROR",
+                                         "VALIDATION_FAILED", "SCHEMA")):
+                has_schema_error = True
+    # Only return GRAPHQL_ERROR if we detected a clear schema/API error
+    # Otherwise default to CARD_DECLINED (most Shopify negotiate errors
+    # in the payment step are card-related even with generic messages)
+    return "GRAPHQL_ERROR" if has_schema_error else "CARD_DECLINED"
 
 
 def _make_session(proxy_str: Optional[str], ua: Optional[str] = None) -> tuple[AsyncSession, bool]:
@@ -1448,45 +1463,54 @@ async def validate_card(
             # Get storefront delivery estimates (GraphQL) - background task
             asyncio.create_task(_get_delivery_estimates(session, ourl, variant_id, ua, client_hints))
 
-            # Add to cart
+            # Add to cart (with retry)
             cart_added = False
-            for payload, ct in [
-                (f"id={variant_id}&quantity=1",
-                 "application/x-www-form-urlencoded; charset=UTF-8"),
-                (orjson.dumps({"items": [{"id": int(variant_id), "quantity": 1}]}),
-                 "application/json"),
-            ]:
-                try:
-                    r = await session.post(
-                        f"{ourl}/cart/add.js",
-                        data=payload,
-                        headers={
-                            **base_headers,
-                            "Content-Type": ct,
-                            "Accept": "application/json, text/javascript, */*; q=0.01",
-                            "x-requested-with": "XMLHttpRequest",
-                        },
-                    )
-                    if r.status_code == 200:
-                        cart_added = True
-                        try:
-                            j = orjson.loads(r.content)
-                            cart_token = j.get('cart_token') or cart_token
-                        except Exception:
-                            pass
-                        break
-                    else:
-                        log.debug("cart add failed status: %s body: %s", r.status_code, r.text[:200])
-                except Exception as ex:
-                    log.debug("cart add exception: %s", ex)
-                    continue
+            cart_last_status = 0
+            for cart_attempt in range(2):
+                for payload, ct in [
+                    (f"id={variant_id}&quantity=1",
+                     "application/x-www-form-urlencoded; charset=UTF-8"),
+                    (orjson.dumps({"items": [{"id": int(variant_id), "quantity": 1}]}),
+                     "application/json"),
+                ]:
+                    try:
+                        r = await session.post(
+                            f"{ourl}/cart/add.js",
+                            data=payload,
+                            headers={
+                                **base_headers,
+                                "Content-Type": ct,
+                                "Accept": "application/json, text/javascript, */*; q=0.01",
+                                "x-requested-with": "XMLHttpRequest",
+                            },
+                        )
+                        cart_last_status = r.status_code
+                        if r.status_code == 200:
+                            cart_added = True
+                            try:
+                                j = orjson.loads(r.content)
+                                cart_token = j.get('cart_token') or cart_token
+                            except Exception:
+                                pass
+                            break
+                        else:
+                            log.debug("cart add failed status: %s body: %s", r.status_code, r.text[:200])
+                    except Exception as ex:
+                        log.debug("cart add exception: %s", ex)
+                        continue
+                if cart_added:
+                    break
+                if cart_attempt == 0:
+                    await asyncio.sleep(random.uniform(0.5, 1.0))
 
             if not cart_added:
+                if cart_last_status in (404, 422):
+                    return _r("NO_PRODUCT")
                 return _r("CART_FAILED")
 
             # Send Monorail interaction & add-to-cart events will be sent later with actual shop ID
 
-            await asyncio.sleep(random.uniform(1.0, 2.0))
+            await asyncio.sleep(random.uniform(0.3, 0.8))
 
             # Simulate viewing/refreshing cart - optimized
             try:
@@ -1500,7 +1524,7 @@ async def validate_card(
             except Exception:
                 pass
 
-            await asyncio.sleep(random.uniform(1.5, 3.0))
+            await asyncio.sleep(random.uniform(0.5, 1.2))
 
             # Start checkout by submitting cart post request to /cart, fall back to /checkout/ if needed
             checkout_url = None
@@ -1793,11 +1817,11 @@ async def validate_card(
                 }
 
             # ── 3. Shipping proposal ─────────────────────────────────────
-            await asyncio.sleep(random.uniform(2.0, 4.0))
-            ship_vars      = _base_vars()
+            await asyncio.sleep(random.uniform(0.3, 0.8))
             resp_json: Any = None
 
             for attempt in range(3):
+                ship_vars = _base_vars()
                 try:
                     r = await session.post(
                         graphql_url,
@@ -1813,6 +1837,15 @@ async def validate_card(
                         await asyncio.sleep(1)
                     continue
 
+                # Refresh SST from response headers even on error
+                try:
+                    _retry_sst = r.headers.get("x-checkout-one-session-token")
+                    if _retry_sst:
+                        sst = _retry_sst
+                        gql_headers["x-checkout-one-session-token"] = sst
+                except Exception:
+                    pass
+
                 data = resp_json.get("data", {}) or {}
                 if data.get("session"):
                     break
@@ -1821,16 +1854,13 @@ async def validate_card(
                 if gql_errs:
                     log.debug("shipping proposal GQL errors: %s", gql_errs)
                     interpreted = _parse_gql_errors(gql_errs)
-                    # For checkout-level errors (not card step), only bail
-                    # immediately on non-retryable state errors
                     if interpreted in ("SESSION_EXPIRED", "SITE_REQUIRES_LOGIN",
                                        "THROTTLED", "NO_PRODUCT"):
                         return _r(interpreted)
                     if attempt < 2:
-                        await asyncio.sleep(1.5)
+                        await asyncio.sleep(1.0)
                         continue
-                    return _r(interpreted if interpreted != "GRAPHQL_ERROR"
-                              else "GRAPHQL_ERROR")
+                    return _r(interpreted)
 
             if not resp_json or not (resp_json.get("data") or {}).get("session"):
                 return _r("GRAPHQL_ERROR")
@@ -1994,10 +2024,9 @@ async def validate_card(
                 return _r("NO_SHOPIFY_PAYMENTS_GATEWAY")
 
             # ── 4. Delivery proposal ─────────────────────────────────────
-            await asyncio.sleep(random.uniform(1.5, 3.0))
-            # IMPORTANT: deep-copy the base vars so we don't share mutable state
-            deliv_vars = copy.deepcopy(ship_vars)
-            deliv_vars["sessionInput"]["sessionToken"] = sst
+            await asyncio.sleep(random.uniform(0.3, 0.8))
+            # Build fresh delivery vars with current SST
+            deliv_vars = _base_vars()
 
             deliv_vars["delivery"]["deliveryLines"][0].update({
                 "destination": {
@@ -2008,16 +2037,25 @@ async def validate_card(
                         "zoneCode": state, "phone": phone,
                     }
                 },
-                "selectedDeliveryStrategy": {
-                    "deliveryStrategyByHandle": {
-                        "handle": delivery_strategy, "customDeliveryRate": False
-                    },
-                    "options": {},
-                },
-                "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
-                "expectedTotalPrice": {
-                    "value": {"amount": str(shipping_amount), "currencyCode": currency}
-                },
+                "selectedDeliveryStrategy": (
+                    {
+                        "deliveryStrategyByHandle": {
+                            "handle": delivery_strategy, "customDeliveryRate": False
+                        },
+                        "options": {},
+                    } if delivery_strategy else {
+                        "deliveryStrategyMatchingConditions": {
+                            "estimatedTimeInTransit": {"any": True},
+                            "shipments": {"any": True},
+                        },
+                        "options": {},
+                    }
+                ),
+                "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]} if delivery_strategy else {"any": True},
+                "expectedTotalPrice": (
+                    {"value": {"amount": str(shipping_amount), "currencyCode": currency}}
+                    if shipping_amount else {"any": True}
+                ),
                 "destinationChanged": False,
             })
             deliv_vars["payment"]["billingAddress"] = {
@@ -2136,7 +2174,7 @@ async def validate_card(
                 log.debug("delivery proposal error: %s", ex)
 
             # ── 5. Tokenize card ─────────────────────────────────────────
-            await asyncio.sleep(random.uniform(2.0, 4.0))
+            await asyncio.sleep(random.uniform(0.5, 1.0))
             cc_clean = cc.strip().replace(" ", "").replace("-", "")
             cc_spaced = " ".join([cc_clean[i:i+4] for i in range(0, len(cc_clean), 4)])
 
@@ -2230,7 +2268,7 @@ async def validate_card(
                 return _r("TOKENIZATION_FAILED")
 
             # ── 6. Submit for completion ──────────────────────────────────
-            await asyncio.sleep(random.uniform(1.5, 3.0))
+            await asyncio.sleep(random.uniform(0.3, 0.8))
             billing_addr = {
                 "streetAddress": {
                     "address1": street, "address2": "", "city": city,
@@ -2277,14 +2315,22 @@ async def validate_card(
                                             "oneTimeUse": False
                                         }
                                     },
-                                    "selectedDeliveryStrategy": {
-                                        "deliveryStrategyByHandle": {
-                                            "handle": delivery_strategy,
-                                            "customDeliveryRate": False,
-                                        },
-                                        "options": {"phone": phone}
-                                    },
-                                    "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
+                                    "selectedDeliveryStrategy": (
+                                        {
+                                            "deliveryStrategyByHandle": {
+                                                "handle": delivery_strategy,
+                                                "customDeliveryRate": False,
+                                            },
+                                            "options": {"phone": phone}
+                                        } if delivery_strategy else {
+                                            "deliveryStrategyMatchingConditions": {
+                                                "estimatedTimeInTransit": {"any": True},
+                                                "shipments": {"any": True},
+                                            },
+                                            "options": {},
+                                        }
+                                    ),
+                                    "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]} if delivery_strategy else {"any": True},
                                     "deliveryMethodTypes": ["SHIPPING"],
                                     "expectedTotalPrice": {"any": True},
                                     "destinationChanged": True
