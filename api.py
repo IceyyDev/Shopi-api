@@ -570,6 +570,11 @@ def _parse_gql_errors(errors: list) -> str:
     """
     has_schema_error = False
     for err in errors:
+        # Check extensions.code for schema-level errors
+        ext_code = str((err.get("extensions") or {}).get("code") or "").upper()
+        if ext_code in ("INVALID_VARIABLE", "VARIABLE_NOT_PROVIDED",
+                        "PARSE_ERROR", "VALIDATION_ERROR", "SCHEMA_ERROR"):
+            has_schema_error = True
         for field in ("code", "nonLocalizedMessage", "localizedMessage",
                       "message", "localizedMessageHtml", "messageUntranslated"):
             raw = str(err.get(field) or "")
@@ -1737,7 +1742,6 @@ async def validate_card(
                                     "countryCode": country_code, "postalCode": s_zip,
                                     "firstName": first, "lastName": last,
                                     "zoneCode": state, "phone": phone,
-                                    "provinceCode": state,
                                 }
                             },
                             "selectedDeliveryStrategy": {
